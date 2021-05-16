@@ -48,21 +48,29 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <unistd.h>
 
 class Cmd {
+public:
+	struct Hint {
+		std::string hint_string;
+		int color = -1;
+		bool bold = false;
+	};
+
 private:
 	static constexpr int MaxLineLength = 4096;
 
-	using hints_type   = std::function<std::optional<std::string>(std::string_view, int *, bool *)>;
-	using command_type = std::function<bool(std::string_view)>;
+	using hints_type   = std::function<std::optional<Hint>(std::string_view)>;
+	using command_type = std::function<bool(Cmd *cmd, std::string_view)>;
 
 	// The State structure represents the state during line editing.
 	// We pass this state to functions implementing specific editing functionalities.
 	struct State {
-		std::string buf;      // Edited line buffer.
-		size_t pos;           // Current cursor position.
-		size_t oldpos;        // Previous refresh cursor position.
-		size_t cols;          // Number of columns in terminal.
-		size_t maxrows;       // Maximum num of rows used so far (multiline mode)
-		size_t history_index; // The history index we are currently editing.
+		std::string buf;          // Edited line buffer.
+		size_t pos           = 0; // Current cursor position.
+		size_t oldpos        = 0; // Previous refresh cursor position.
+		size_t cols          = 0; // Number of columns in terminal.
+		size_t maxrows       = 0; // Maximum num of rows used so far (multiline mode)
+		size_t history_index = 0; // The history index we are currently editing.
+		bool mask_mode       = false;
 	};
 
 	struct ParseResult {
@@ -121,6 +129,16 @@ private:
 		return std::mismatch(prefix.begin(), prefix.end(), s.begin()).first == prefix.end();
 	}
 
+	static bool iequals(std::string_view a, std::string_view b) {
+		if (a.size() != b.size()) {
+			return false;
+		}
+
+		return std::equal(a.begin(), a.end(), b.begin(), b.end(), [](unsigned char a, unsigned char b) {
+			return tolower(a) == tolower(b);
+		});
+	}
+
 	static bool isUnsupportedTerm() {
 
 		const char *term = getenv("TERM");
@@ -130,7 +148,7 @@ private:
 
 		static const char *unsupported_terms[] = {"dumb", "cons25", "emacs"};
 		for (const char *t : unsupported_terms) {
-			if (!strcasecmp(term, t)) {
+			if (iequals(term, t)) {
 				return true;
 			}
 		}
@@ -144,9 +162,32 @@ private:
 		fflush(stderr);
 	}
 
+	static bool isDelim(char ch) {
+		return strchr("[]!()=+-*/%&|^~<>\t\n\r ", ch) != nullptr;
+	}
+
+	static ParseResult parseline(std::string line) {
+
+		trim(line);
+
+		if (line.empty()) {
+			return {};
+		}
+
+		size_t i = 0;
+		while (i < line.size() && !isDelim(line[i])) {
+			++i;
+		}
+
+		std::string cmd  = line.substr(0, i);
+		std::string args = line.substr(i);
+		trim(args);
+		return ParseResult{cmd, args, line};
+	}
+
 public:
-	Cmd(const std::string &history_file, int complete_key = TAB, FILE *in = stdin, FILE *out = stdout)
-		: in_(in), out_(out), complete_key_(complete_key), history_file_(history_file) {
+	explicit Cmd(const std::string &history_file, FILE *in = stdin, FILE *out = stdout)
+		: in_(in), out_(out), history_file_(history_file) {
 
 		in_fd_  = fileno(in_);
 		out_fd_ = fileno(out_);
@@ -154,8 +195,8 @@ public:
 		loadHistory();
 	}
 
-	Cmd(int complete_key = TAB, FILE *in = stdin, FILE *out = stdout)
-		: in_(in), out_(out), complete_key_(complete_key) {
+	explicit Cmd(FILE *in = stdin, FILE *out = stdout)
+		: in_(in), out_(out) {
 
 		in_fd_  = fileno(in_);
 		out_fd_ = fileno(out_);
@@ -164,7 +205,6 @@ public:
 	~Cmd() {
 		// At exit we'll try to fix the terminal to the initial conditions.
 		disableRawMode(in_fd_);
-
 		saveHistory();
 	}
 
@@ -183,9 +223,44 @@ public:
 		write_string("\x1b[H\x1b[2J");
 	}
 
+	bool addHistoryEntry(const std::string &line) {
+
+		// Don't add duplicated lines.
+		if (!history_.empty() && history_.back() == line) {
+			return false;
+		}
+
+		history_.push_back(line);
+		return true;
+	}
+
+	std::optional<std::string> nextLine(bool mask_mode = false) {
+		if (!isatty(in_fd_)) {
+			// Not a tty: read from file / pipe.
+			return readlineNoTTY();
+		} else if (isUnsupportedTerm()) {
+
+			write_string(prompt);
+			fflush(out_);
+
+			char buf[MaxLineLength];
+			if (fgets(buf, sizeof(buf), in_) == nullptr) {
+				return {};
+			}
+
+			size_t len = strlen(buf);
+			while (len != 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
+				buf[--len] = '\0';
+			}
+
+			return buf;
+		} else {
+			return readlineRaw(mask_mode);
+		}
+	}
+
 	void cmdLoop() {
 		bool stop = false;
-
 		while (!stop) {
 			std::optional<std::string> line = nextLine();
 			if (!line) {
@@ -216,12 +291,11 @@ public:
 private:
 	// This function is called when the standard input file descriptor not attached to a TTY.
 	// So for example when the program is called in pipe or with a file redirected to its standard input.
-	// In this case, we want to be able to return the line regardless of its length (by default we are limited to 4k).
 	std::string readlineNoTTY() const {
 		std::string line;
 
 		while (true) {
-			int ch = fgetc(in_);
+			const int ch = fgetc(in_);
 			if (ch == EOF || ch == '\n') {
 				return line;
 			} else {
@@ -230,42 +304,11 @@ private:
 		}
 	}
 
-	std::optional<std::string> nextLine() {
-		if (!isatty(in_fd_)) {
-			// Not a tty: read from file / pipe. In this mode we don't want any limit to the line size, so we call a function to handle that.
-			return readlineNoTTY();
-
-		} else if (isUnsupportedTerm()) {
-
-			write_string(prompt);
-			fflush(out_);
-
-			char buf[MaxLineLength];
-			if (fgets(buf, sizeof(buf), in_) == nullptr) {
-				return {};
-			}
-
-			size_t len = strlen(buf);
-			while (len && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
-				len--;
-				buf[len] = '\0';
-			}
-
-			return buf;
-		} else {
-			return readlineRaw();
-		}
-	}
-
 	bool oneCmd(const std::string &str) {
 		auto [cmd, arg, line] = parseline(str);
 
 		if (line.empty()) {
-			return emptyline();
-		}
-
-		if (cmd.empty()) {
-			return defaultHandler(line);
+			return false;
 		}
 
 		addHistoryEntry(line);
@@ -276,52 +319,25 @@ private:
 		}
 
 		auto func = it->second;
-		return func(arg);
+		return func(this, arg);
 	}
 
-	bool emptyline() {
-		if (!history_.empty()) {
-			return oneCmd(history_.back());
-		}
-
-		return false;
-	}
-
-	bool defaultHandler(const std::string &line) {
+	bool defaultHandler(std::string_view line) {
 		write_string("*** Unknown command: ");
 		write_string(line);
 		write_char('\n');
 		return false;
 	}
 
-	ParseResult parseline(std::string line) const {
-
-		trim(line);
-
-		if (line.empty()) {
-			return {};
-		}
-
-		size_t i = 0;
-		while (i < line.size() && identchars_.find(line[i]) != std::string::npos) {
-			++i;
-		}
-
-		std::string cmd  = line.substr(0, i);
-		std::string args = line.substr(i);
-		trim(args);
-		return ParseResult{cmd, args, line};
-	}
-
 	// This function calls the line editing function editLine() using the STDIN file descriptor set in raw mode.
-	std::optional<std::string> readlineRaw() {
+	std::optional<std::string> readlineRaw(bool mask_mode) {
 
 		int r = enableRawMode(in_fd_);
 		if (r < 0) {
 			return {};
 		}
 
-		std::optional<std::string> buf = editLine();
+		std::optional<std::string> buf = editLine(mask_mode);
 		disableRawMode(in_fd_);
 		write_char('\n');
 		return buf;
@@ -329,7 +345,7 @@ private:
 
 	int enableRawMode(int fd) {
 
-		if (raw_mode) {
+		if (raw_mode_) {
 			return 0;
 		}
 
@@ -359,21 +375,21 @@ private:
 		if (tcsetattr(fd, TCSAFLUSH, &raw) < 0)
 			return -ENOTTY;
 
-		raw_mode = true;
+		raw_mode_ = true;
 		return 0;
 	}
 
 	void disableRawMode(int fd) {
 		// Don't even check the return value as it's too late.
-		if (raw_mode && tcsetattr(fd, TCSAFLUSH, &orig_termios_) != -1) {
-			raw_mode = false;
+		if (raw_mode_ && tcsetattr(fd, TCSAFLUSH, &orig_termios_) != -1) {
+			raw_mode_ = false;
 		}
 	}
 
 	// This function is the core of the line editing capability.
 	// The resulting string is put into 'buf' when the user type enter, or when ctrl+d is typed.
 	// The function returns the length of the current buffer.
-	std::optional<std::string> editLine() {
+	std::optional<std::string> editLine(bool mask_mode) {
 		State state;
 
 		// Populate the state that we pass to functions implementing specific editing functionalities.
@@ -382,6 +398,7 @@ private:
 		state.cols          = getColumns();
 		state.maxrows       = 0;
 		state.history_index = 0;
+		state.mask_mode     = mask_mode;
 
 		// The latest history entry is always our current buffer, that initially is just an empty string.
 		addHistoryEntry("");
@@ -392,7 +409,7 @@ private:
 
 		while (true) {
 			char ch;
-			char seq[3];
+			char seq[5];
 
 			int nread = read(in_fd_, &ch, 1);
 			if (nread <= 0) {
@@ -419,6 +436,10 @@ private:
 			case ENTER: // enter
 				history_.pop_back();
 
+				if (multiline_mode) {
+					editMoveEnd(&state);
+				}
+
 				if (hints_handler_) {
 					// Force a refresh without hints to leave the previous line as the user typed it after a newline.
 					hints_type hc  = hints_handler_;
@@ -429,12 +450,12 @@ private:
 				return state.buf;
 			case CTRL_C: // ctrl-c
 				return {};
-			case CTRL_Z: /* ctrl-z */
+			case CTRL_Z: // ctrl-z
 #ifdef SIGTSTP
-				/* send ourselves SIGSUSP */
+				// send ourselves SIGSUSP
 				disableRawMode(in_fd_);
 				raise(SIGTSTP);
-				/* and resume */
+				// and resume
 				enableRawMode(in_fd_);
 				refreshLine(&state);
 #endif
@@ -482,15 +503,30 @@ private:
 				// ESC [ sequences.
 				if (seq[0] == '[') {
 					if (isdigit(seq[1])) {
+
 						// Extended escape, read additional byte.
 						if (read(in_fd_, seq + 2, 1) == -1)
 							break;
-						if (seq[2] == '~') {
+
+						switch (seq[2]) {
+						case '~':
 							switch (seq[1]) {
 							case '3': // Delete key.
 								editDelete(&state);
 								break;
 							}
+							break;
+						case ';':
+							// Extended escape, read two additional bytes.
+							if (read(in_fd_, seq + 3, 2) == -1)
+								break;
+
+							if (seq[3] == '5' && seq[4] == 'D') {
+								editMovePrevWord(&state);
+							} else if (seq[3] == '5' && seq[4] == 'C') {
+								editMoveNextWord(&state);
+							}
+							break;
 						}
 					} else {
 						switch (seq[1]) {
@@ -565,9 +601,9 @@ private:
 		if (state->buf.size() == state->pos) {
 			state->buf.insert(state->pos++, 1, ch);
 
-			if (prompt.size() + state->buf.size() < state->cols && !hints_handler_) {
+			if (!multiline_mode && prompt.size() + state->buf.size() < state->cols && !hints_handler_) {
 				// Avoid a full update of the line in the trivial case.
-				const char d = (mask_mode) ? '*' : ch;
+				const char d = (state->mask_mode) ? '*' : ch;
 				if (write_char(d) == -1) {
 					return -1;
 				}
@@ -595,6 +631,28 @@ private:
 			state->pos++;
 			refreshLine(state);
 		}
+	}
+
+	// Move cursor on the right one word
+	void editMoveNextWord(State *state) {
+		while (state->pos < state->buf.size() && state->buf[state->pos] == ' ')
+			state->pos++;
+
+		while (state->pos < state->buf.size() && state->buf[state->pos] != ' ')
+			state->pos++;
+
+		refreshLine(state);
+	}
+
+	// Move cursor on the left one word
+	void editMovePrevWord(State *state) {
+		while (state->pos > 0 && state->buf[state->pos - 1] == ' ')
+			state->pos--;
+
+		while (state->pos > 0 && state->buf[state->pos - 1] != ' ')
+			state->pos--;
+
+		refreshLine(state);
 	}
 
 	// Move cursor to the start of the line.
@@ -675,7 +733,11 @@ private:
 	}
 
 	void refreshLine(State *state) {
-		refreshSingleLine(state);
+		if (multiline_mode) {
+			refreshMultiLine(state);
+		} else {
+			refreshSingleLine(state);
+		}
 	}
 
 	// Single line low level line refresh. Rewrite the currently edited line accordingly to the buffer content, cursor position, and number of columns of the terminal.
@@ -696,24 +758,97 @@ private:
 		}
 
 		// Cursor to left edge
-		snprintf(seq, sizeof(seq), "\r");
-		ab.append(seq);
+		ab.append("\r");
+
 		// Write the prompt and the current buffer content
 		ab.append(prompt);
 
-		if (mask_mode) {
+		if (state->mask_mode) {
 			ab.append(buf_view.size(), '*');
 		} else {
 			ab.append(buf_view);
 		}
 		// Show hits if any.
 		refreshShowHints(ab, state, plen);
+
 		// Erase to right
-		snprintf(seq, sizeof(seq), "\x1b[0K");
-		ab.append(seq);
+		ab.append("\x1b[0K");
+
 		// Move cursor to original position.
 		snprintf(seq, sizeof(seq), "\r\x1b[%dC", static_cast<int>(pos + plen));
 		ab.append(seq);
+
+		write_string(ab);
+	}
+
+	// Multi line low level line refresh. Rewrite the currently edited line accordingly to the buffer content,
+	// cursor position, and number of columns of the terminal.
+	void refreshMultiLine(State *state) {
+		char seq[64];
+		const int plen     = prompt.size();
+		int rows           = (plen + state->buf.size() + state->cols - 1) / state->cols; // rows used by current buf.
+		const int rpos     = (plen + state->oldpos + state->cols) / state->cols;         // cursor relative row.
+		const int old_rows = state->maxrows;
+		std::string ab;
+
+		// Update maxrows if needed.
+		if (rows > static_cast<int>(state->maxrows)) {
+			state->maxrows = rows;
+		}
+
+		// First step: clear all the lines used before. To do so start by going to the last row.
+		if (old_rows - rpos > 0) {
+			snprintf(seq, sizeof(seq), "\x1b[%dB", old_rows - rpos);
+			ab.append(seq);
+		}
+
+		// Now for every row clear it, go up.
+		for (int j = 0; j < old_rows - 1; j++) {
+			ab.append("\r\x1b[0K\x1b[1A");
+		}
+
+		// Clean the top line.
+		ab.append("\r\x1b[0K");
+
+		// Write the prompt and the current buffer content
+		ab.append(prompt);
+		if (state->mask_mode) {
+			ab.append(state->buf.size(), '*');
+		} else {
+			ab.append(state->buf);
+		}
+
+		// Show hits if any.
+		refreshShowHints(ab, state, plen);
+
+		// If we are at the very end of the screen with our prompt, we need to emit a newline and move the prompt to the first column.
+		if (state->pos && state->pos == state->buf.size() && (state->pos + plen) % state->cols == 0) {
+			ab.append("\n\r");
+			rows++;
+			if (rows > static_cast<int>(state->maxrows)) {
+				state->maxrows = rows;
+			}
+		}
+
+		// Move cursor to right position.
+		int rpos2 = (plen + state->pos + state->cols) / state->cols; // current cursor relative row.
+
+		// Go up till we reach the expected positon.
+		if (rows - rpos2 > 0) {
+			snprintf(seq, sizeof(seq), "\x1b[%dA", rows - rpos2);
+			ab.append(seq);
+		}
+
+		// Set column.
+		const int col = (plen + state->pos) % state->cols;
+		if (col) {
+			snprintf(seq, sizeof(seq), "\r\x1b[%dC", col);
+			ab.append(seq);
+		} else {
+			ab.append("\r");
+		}
+
+		state->oldpos = state->pos;
 
 		write_string(ab);
 	}
@@ -785,7 +920,7 @@ private:
 
 	// This is an helper function for editLine() and is called when the user types the <tab> key in order to complete the string currently in the input.
 	// The state of the editing is encapsulated into the pointed State structure as described in the structure definition.
-	int completeLine(State *ls) {
+	int completeLine(State *state) {
 
 		char ch = 0;
 
@@ -795,7 +930,7 @@ private:
 		for (auto &&elem : commands_) {
 			const std::string &name = elem.first;
 
-			if (starts_with(name, ls->buf)) {
+			if (starts_with(name, state->buf)) {
 				completions.push_back(name);
 			}
 		}
@@ -809,16 +944,16 @@ private:
 			while (!stop) {
 				// Show completion or original buffer
 				if (i < completions.size()) {
-					State saved = *ls;
+					State saved = *state;
 
-					ls->pos = completions[i].size();
-					ls->buf = completions[i];
+					state->pos = completions[i].size();
+					state->buf = completions[i];
 
-					refreshLine(ls);
-					ls->pos = saved.pos;
-					ls->buf = saved.buf;
+					refreshLine(state);
+					state->pos = saved.pos;
+					state->buf = saved.buf;
 				} else {
-					refreshLine(ls);
+					refreshLine(state);
 				}
 
 				int nread = read(in_fd_, &ch, 1);
@@ -835,14 +970,14 @@ private:
 				case ESC: // escape
 					// Re-show original buffer
 					if (i < completions.size())
-						refreshLine(ls);
+						refreshLine(state);
 					stop = true;
 					break;
 				default:
 					// Update buffer and return
 					if (i < completions.size()) {
-						ls->buf = completions[i];
-						ls->pos = ls->buf.size();
+						state->buf = completions[i];
+						state->pos = state->buf.size();
 					}
 					stop = true;
 					break;
@@ -850,43 +985,30 @@ private:
 			}
 		}
 
-		return ch; // Return last read character
+		return ch;
 	}
 
-	bool addHistoryEntry(const std::string &line) {
-
-		// Don't add duplicated lines.
-		if (!history_.empty() && history_.back() == line) {
-			return false;
-		}
-
-		history_.push_back(line);
-		return true;
-	}
-
-	// Helper of refreshSingleLine() and refreshMultiLine() to show hints to the right of the prompt.
+	// Helper of refreshSingleLine() to show hints to the right of the prompt.
 	void refreshShowHints(std::string &ab, State *state, int plen) {
 
 		if (hints_handler_ && plen + state->buf.size() < state->cols) {
-			int color = -1;
-			bool bold = false;
-
-			if (std::optional<std::string> hint = hints_handler_(state->buf, &color, &bold)) {
-				if (bold && color == -1) {
-					color = 37;
+			if (std::optional<Hint> hint = hints_handler_(state->buf)) {
+				if (hint->bold && hint->color == -1) {
+					hint->color = 37;
 				}
 
 				char seq[64];
-				if (color != -1 || bold) {
-					snprintf(seq, sizeof(seq), "\033[%d;%d;49m", bold, color);
+				if (hint->color != -1 || hint->bold) {
+					snprintf(seq, sizeof(seq), "\033[%d;%d;49m", hint->bold, hint->color);
 				} else {
 					seq[0] = '\0';
 				}
 
 				ab.append(seq);
-				ab.append(*hint);
-				if (color != -1 || bold)
-					ab.append("\033[0m", 4);
+				ab.append(hint->hint_string);
+				if (hint->color != -1 || hint->bold) {
+					ab.append("\033[0m");
+				}
 			}
 		}
 	}
@@ -900,19 +1022,18 @@ private:
 	}
 
 public:
-	std::string prompt = "(Cmd) ";
-	bool mask_mode     = false; // Show "***" instead of input. For passwords.
-	bool raw_mode      = false;
+	std::string prompt  = "(Cmd) ";
+	bool multiline_mode = false;
 
 private:
-	std::string identchars_ = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
-	FILE *in_               = stdin;
-	FILE *out_              = stdout;
-	int complete_key_       = TAB;
-	int in_fd_              = STDIN_FILENO;
-	int out_fd_             = STDOUT_FILENO;
+	bool raw_mode_    = false;
+	FILE *in_         = stdin;
+	FILE *out_        = stdout;
+	int complete_key_ = TAB;
+	int in_fd_        = STDIN_FILENO;
+	int out_fd_       = STDOUT_FILENO;
 
-	std::queue<std::string> cmdqueue_;
+private:
 	std::map<std::string, command_type> commands_;
 	hints_type hints_handler_;
 	struct termios orig_termios_; // In order to restore at exit.
