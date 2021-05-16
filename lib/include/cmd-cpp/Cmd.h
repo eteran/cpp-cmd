@@ -1,3 +1,31 @@
+/*
+Copyright (c) 2021-2021, Evan Teran <evan.teran at gmail dot com>
+Copyright (c) 2010-2014, Salvatore Sanfilippo <antirez at gmail dot com>
+Copyright (c) 2010-2013, Pieter Noordhuis <pcnoordhuis at gmail dot com>
+
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice,
+  this list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
 
 #ifndef CMD_H_
 #define CMD_H_
@@ -5,6 +33,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <optional>
@@ -13,48 +42,33 @@
 #include <string_view>
 #include <vector>
 
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
-
-// trim from start (in place)
-static inline void ltrim(std::string &s) {
-	s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) { return !std::isspace(ch); }));
-}
-
-// trim from end (in place)
-static inline void rtrim(std::string &s) {
-	s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(), s.end());
-}
-
-// trim from both ends (in place)
-static inline void trim(std::string &s) {
-	ltrim(s);
-	rtrim(s);
-}
-
-static inline bool starts_with(std::string_view s, std::string_view prefix) {
-	return std::mismatch(prefix.begin(), prefix.end(), s.begin()).first == prefix.end();
-}
 
 class Cmd {
 private:
 	static constexpr int MaxLineLength = 4096;
 
-	using completer_type = std::function<std::vector<std::string>(std::string_view)>;
-	using hints_type     = std::function<std::optional<std::string>(std::string_view, int *, bool *)>;
-	using command_type   = std::function<bool(std::string_view)>;
+	using hints_type   = std::function<std::optional<std::string>(std::string_view, int *, bool *)>;
+	using command_type = std::function<bool(std::string_view)>;
 
-	// The State structure represents the state during line editing. We pass this state to functions implementing specific editing functionalities.
+	// The State structure represents the state during line editing.
+	// We pass this state to functions implementing specific editing functionalities.
 	struct State {
-		char *buf;            // Edited line buffer.
-		size_t buflen;        // Edited line buffer size.
+		std::string buf;      // Edited line buffer.
 		size_t pos;           // Current cursor position.
 		size_t oldpos;        // Previous refresh cursor position.
-		size_t len;           // Current edited line length.
 		size_t cols;          // Number of columns in terminal.
 		size_t maxrows;       // Maximum num of rows used so far (multiline mode)
 		size_t history_index; // The history index we are currently editing.
+	};
+
+	struct ParseResult {
+		std::string cmd;
+		std::string args;
+		std::string line;
 	};
 
 	enum class Direction {
@@ -72,6 +86,7 @@ private:
 		CTRL_F    = 6,  // Ctrl-f
 		CTRL_H    = 8,  // Ctrl-h
 		TAB       = 9,  // Tab
+		LINE_FEED = 10, // Ctrl+Enter
 		CTRL_K    = 11, // Ctrl+k
 		CTRL_L    = 12, // Ctrl+l
 		ENTER     = 13, // Enter
@@ -80,11 +95,65 @@ private:
 		CTRL_T    = 20, // Ctrl-t
 		CTRL_U    = 21, // Ctrl+u
 		CTRL_W    = 23, // Ctrl+w
+		CTRL_Z    = 26,
 		ESC       = 27, // Escape
 		BACKSPACE = 127 // Backspace
 	};
 
+private:
+	// trim from start (in place)
+	static void ltrim(std::string &s) {
+		s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) { return !std::isspace(ch); }));
+	}
+
+	// trim from end (in place)
+	static void rtrim(std::string &s) {
+		s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(), s.end());
+	}
+
+	// trim from both ends (in place)
+	static void trim(std::string &s) {
+		ltrim(s);
+		rtrim(s);
+	}
+
+	static bool starts_with(std::string_view s, std::string_view prefix) {
+		return std::mismatch(prefix.begin(), prefix.end(), s.begin()).first == prefix.end();
+	}
+
+	static bool isUnsupportedTerm() {
+
+		const char *term = getenv("TERM");
+		if (!term) {
+			return false;
+		}
+
+		static const char *unsupported_terms[] = {"dumb", "cons25", "emacs"};
+		for (const char *t : unsupported_terms) {
+			if (!strcasecmp(term, t)) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	// Beep, used for completion when there is nothing to complete or when all the choices were already shown.
+	static void beep() {
+		fprintf(stderr, "\a");
+		fflush(stderr);
+	}
+
 public:
+	Cmd(const std::string &history_file, int complete_key = TAB, FILE *in = stdin, FILE *out = stdout)
+		: in_(in), out_(out), complete_key_(complete_key), history_file_(history_file) {
+
+		in_fd_  = fileno(in_);
+		out_fd_ = fileno(out_);
+
+		loadHistory();
+	}
+
 	Cmd(int complete_key = TAB, FILE *in = stdin, FILE *out = stdout)
 		: in_(in), out_(out), complete_key_(complete_key) {
 
@@ -95,6 +164,8 @@ public:
 	~Cmd() {
 		// At exit we'll try to fix the terminal to the initial conditions.
 		disableRawMode(in_fd_);
+
+		saveHistory();
 	}
 
 public:
@@ -103,66 +174,90 @@ public:
 		hints_handler_ = fn;
 	}
 
-	// This function is called when linenoise() is called with the standard input file descriptor not attached to a TTY. So for example when the program using linenoise is called in pipe or with a file redirected to its standard input. In this case, we want to be able to return the line regardless of its length (by default we are limited to 4k).
-	std::string linenoiseNoTTY() {
-		std::string line;
-
-		while (true) {
-			int c = fgetc(in_);
-			if (c == EOF || c == '\n') {
-				return line;
-			} else {
-				line.push_back(c);
-			}
-		}
+	void registerCommand(const std::string &cmd, command_type handler) {
+		commands_.emplace(cmd, handler);
 	}
 
-	void cmdloop(std::string_view intro = {}) {
-		char buf[MaxLineLength];
+	// Clear the screen. Used to handle ctrl+l
+	void clearScreen() {
+		write_string("\x1b[H\x1b[2J");
+	}
 
-		if (!intro.empty()) {
-			write_string(intro);
-			fputc('\n', out_);
-		}
-
+	void cmdLoop() {
 		bool stop = false;
 
 		while (!stop) {
+			std::optional<std::string> line = nextLine();
+			if (!line) {
+				break;
+			}
+			stop = oneCmd(*line);
+		}
+	}
 
-			if (!isatty(in_fd_)) {
-				// Not a tty: read from file / pipe. In this mode we don't want any limit to the line size, so we call a function to handle that.
-				std::string line = linenoiseNoTTY();
-				stop             = onecmd(line);
-
-			} else if (isUnsupportedTerm()) {
-
-				write_string(prompt);
-				fflush(out_);
-
-				if (fgets(buf, MaxLineLength, in_) == nullptr) {
-					break;
-				}
-
-				size_t len = strlen(buf);
-				while (len && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
-					len--;
-					buf[len] = '\0';
-				}
-
-				stop = onecmd(buf);
-
-			} else {
-				const int count = linenoiseRaw(buf, MaxLineLength);
-				if (count < 0) {
-					break;
-				}
-
-				stop = onecmd(buf);
+	void saveHistory() {
+		if (history_file_) {
+			std::ofstream file(*history_file_);
+			for (const std::string &entry : history_) {
+				file << entry << '\n';
 			}
 		}
 	}
 
-	bool onecmd(const std::string &str) {
+	void loadHistory() {
+		if (history_file_) {
+			std::ifstream file(*history_file_);
+			for (std::string line; std::getline(file, line);) {
+				addHistoryEntry(line);
+			}
+		}
+	}
+
+private:
+	// This function is called when the standard input file descriptor not attached to a TTY.
+	// So for example when the program is called in pipe or with a file redirected to its standard input.
+	// In this case, we want to be able to return the line regardless of its length (by default we are limited to 4k).
+	std::string readlineNoTTY() const {
+		std::string line;
+
+		while (true) {
+			int ch = fgetc(in_);
+			if (ch == EOF || ch == '\n') {
+				return line;
+			} else {
+				line.push_back(ch);
+			}
+		}
+	}
+
+	std::optional<std::string> nextLine() {
+		if (!isatty(in_fd_)) {
+			// Not a tty: read from file / pipe. In this mode we don't want any limit to the line size, so we call a function to handle that.
+			return readlineNoTTY();
+
+		} else if (isUnsupportedTerm()) {
+
+			write_string(prompt);
+			fflush(out_);
+
+			char buf[MaxLineLength];
+			if (fgets(buf, sizeof(buf), in_) == nullptr) {
+				return {};
+			}
+
+			size_t len = strlen(buf);
+			while (len && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
+				len--;
+				buf[len] = '\0';
+			}
+
+			return buf;
+		} else {
+			return readlineRaw();
+		}
+	}
+
+	bool oneCmd(const std::string &str) {
 		auto [cmd, arg, line] = parseline(str);
 
 		if (line.empty()) {
@@ -186,7 +281,7 @@ public:
 
 	bool emptyline() {
 		if (!history_.empty()) {
-			return onecmd(history_.back());
+			return oneCmd(history_.back());
 		}
 
 		return false;
@@ -199,14 +294,7 @@ public:
 		return false;
 	}
 
-private:
-	struct parse_result {
-		std::string cmd;
-		std::string args;
-		std::string line;
-	};
-
-	parse_result parseline(std::string line) const {
+	ParseResult parseline(std::string line) const {
 
 		trim(line);
 
@@ -215,7 +303,6 @@ private:
 		}
 
 		size_t i = 0;
-
 		while (i < line.size() && identchars_.find(line[i]) != std::string::npos) {
 			++i;
 		}
@@ -223,45 +310,23 @@ private:
 		std::string cmd  = line.substr(0, i);
 		std::string args = line.substr(i);
 		trim(args);
-		return parse_result{cmd, args, line};
+		return ParseResult{cmd, args, line};
 	}
 
-	static bool isUnsupportedTerm() {
-
-		const char *term = getenv("TERM");
-		if (!term) {
-			return false;
-		}
-
-		static const char *unsupported_terms[] = {"dumb", "cons25", "emacs"};
-		for (const char *t : unsupported_terms) {
-			if (!strcasecmp(term, t)) {
-				return true;
-			}
-		}
-
-		return false;
-	}
-
-	// This function calls the line editing function linenoiseEdit() using the STDIN file descriptor set in raw mode.
-	int linenoiseRaw(char *buf, size_t buflen) {
-
-		if (buflen == 0) {
-			return -EINVAL;
-		}
+	// This function calls the line editing function editLine() using the STDIN file descriptor set in raw mode.
+	std::optional<std::string> readlineRaw() {
 
 		int r = enableRawMode(in_fd_);
 		if (r < 0) {
-			return r;
+			return {};
 		}
 
-		int count = linenoiseEdit(buf, buflen);
+		std::optional<std::string> buf = editLine();
 		disableRawMode(in_fd_);
 		write_char('\n');
-		return count;
+		return buf;
 	}
 
-	// Raw mode: 1960 magic shit.
 	int enableRawMode(int fd) {
 
 		if (raw_mode) {
@@ -284,7 +349,7 @@ private:
 		raw.c_oflag &= ~(OPOST);
 		// control modes - set 8 bit chars
 		raw.c_cflag |= (CS8);
-		// local modes - choing off, canonical off, no extended functions, no signal chars (^Z,^C)
+		// local modes - echoing off, canonical off, no extended functions, no signal chars (^Z,^C)
 		raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
 		// control chars - set return condition: min number of bytes and timer. We want read to return every single byte, without timeout.
 		raw.c_cc[VMIN]  = 1;
@@ -298,103 +363,114 @@ private:
 		return 0;
 	}
 
-	// This function is the core of the line editing capability of linenoise. It expects 'fd' to be already in "raw mode" so that every key pressed will be returned ASAP to read().
+	void disableRawMode(int fd) {
+		// Don't even check the return value as it's too late.
+		if (raw_mode && tcsetattr(fd, TCSAFLUSH, &orig_termios_) != -1) {
+			raw_mode = false;
+		}
+	}
+
+	// This function is the core of the line editing capability.
 	// The resulting string is put into 'buf' when the user type enter, or when ctrl+d is typed.
 	// The function returns the length of the current buffer.
-	int linenoiseEdit(char *buf, size_t buflen) {
-		State l;
+	std::optional<std::string> editLine() {
+		State state;
 
-		// Populate the linenoise state that we pass to functions implementing specific editing functionalities.
-		l.buf    = buf;
-		l.buflen = buflen;
-		l.oldpos = l.pos = 0;
-		l.len            = 0;
-		l.cols           = getColumns();
-		l.maxrows        = 0;
-		l.history_index  = 0;
-
-		// Buffer starts empty.
-		l.buf[0] = '\0';
-		l.buflen--; // Make sure there is always space for the nulterm
+		// Populate the state that we pass to functions implementing specific editing functionalities.
+		state.oldpos        = 0;
+		state.pos           = 0;
+		state.cols          = getColumns();
+		state.maxrows       = 0;
+		state.history_index = 0;
 
 		// The latest history entry is always our current buffer, that initially is just an empty string.
 		addHistoryEntry("");
 
 		if (write_string(prompt) == -1) {
-			return -1;
+			return {};
 		}
 
 		while (true) {
-			char c;
+			char ch;
 			char seq[3];
 
-			int nread = read(in_fd_, &c, 1);
+			int nread = read(in_fd_, &ch, 1);
 			if (nread <= 0) {
-				return l.len;
+				return state.buf;
 			}
 
 			// Only autocomplete when the callback is set. It returns < 0 when there was an error reading from fd.
 			// Otherwise it will return the character that should be handled next.
-			if (c == complete_key_) {
-				c = completeLine(&l);
+			if (ch == complete_key_) {
+				int r = completeLine(&state);
 				// Return on errors
-				if (c < 0)
-					return l.len;
+				if (ch < 0)
+					return state.buf;
+
 				// Read next character when 0
-				if (c == 0)
+				if (ch == '\0')
 					continue;
+
+				ch = r;
 			}
 
-			switch (c) {
+			switch (ch) {
+			case LINE_FEED:
 			case ENTER: // enter
 				history_.pop_back();
-				if (multi_line_mode) {
-					linenoiseEditMoveEnd(&l);
-				}
 
 				if (hints_handler_) {
 					// Force a refresh without hints to leave the previous line as the user typed it after a newline.
 					hints_type hc  = hints_handler_;
 					hints_handler_ = nullptr;
-					refreshLine(&l);
+					refreshLine(&state);
 					hints_handler_ = hc;
 				}
-				return static_cast<int>(l.len);
+				return state.buf;
 			case CTRL_C: // ctrl-c
-				return -EAGAIN;
+				return {};
+			case CTRL_Z: /* ctrl-z */
+#ifdef SIGTSTP
+				/* send ourselves SIGSUSP */
+				disableRawMode(in_fd_);
+				raise(SIGTSTP);
+				/* and resume */
+				enableRawMode(in_fd_);
+				refreshLine(&state);
+#endif
+				continue;
 			case BACKSPACE: // backspace
-			case 8:         // ctrl-h
-				linenoiseEditBackspace(&l);
+			case CTRL_H:    // ctrl-h
+				editBackspace(&state);
 				break;
 			case CTRL_D: // ctrl-d, remove char at right of cursor, or if the line is empty, act as end-of-file.
-				if (l.len > 0) {
-					linenoiseEditDelete(&l);
+				if (state.buf.size() > 0) {
+					editDelete(&state);
 				} else {
 					history_.pop_back();
-					return -1;
+					return {};
 				}
 				break;
 			case CTRL_T: // ctrl-t, swaps current character with previous.
-				if (l.pos > 0 && l.pos < l.len) {
-					int aux        = buf[l.pos - 1];
-					buf[l.pos - 1] = buf[l.pos];
-					buf[l.pos]     = aux;
-					if (l.pos != l.len - 1)
-						l.pos++;
-					refreshLine(&l);
+				if (state.pos > 0 && state.pos < state.buf.size()) {
+					std::swap(state.buf[state.pos], state.buf[state.pos - 1]);
+
+					if (state.pos != state.buf.size() - 1)
+						state.pos++;
+					refreshLine(&state);
 				}
 				break;
 			case CTRL_B: // ctrl-b
-				linenoiseEditMoveLeft(&l);
+				editMoveLeft(&state);
 				break;
 			case CTRL_F: // ctrl-f
-				linenoiseEditMoveRight(&l);
+				editMoveRight(&state);
 				break;
 			case CTRL_P: // ctrl-p
-				linenoiseEditHistoryNext(&l, Direction::Prev);
+				editHistoryNext(&state, Direction::Prev);
 				break;
 			case CTRL_N: // ctrl-n
-				linenoiseEditHistoryNext(&l, Direction::Next);
+				editHistoryNext(&state, Direction::Next);
 				break;
 			case ESC: // escape sequence
 				// Read the next two bytes representing the escape sequence. Use two calls to handle slow terminals returning the two chars at different times.
@@ -412,29 +488,29 @@ private:
 						if (seq[2] == '~') {
 							switch (seq[1]) {
 							case '3': // Delete key.
-								linenoiseEditDelete(&l);
+								editDelete(&state);
 								break;
 							}
 						}
 					} else {
 						switch (seq[1]) {
 						case 'A': // Up
-							linenoiseEditHistoryNext(&l, Direction::Prev);
+							editHistoryNext(&state, Direction::Prev);
 							break;
 						case 'B': // Down
-							linenoiseEditHistoryNext(&l, Direction::Next);
+							editHistoryNext(&state, Direction::Next);
 							break;
 						case 'C': // Right
-							linenoiseEditMoveRight(&l);
+							editMoveRight(&state);
 							break;
 						case 'D': // Left
-							linenoiseEditMoveLeft(&l);
+							editMoveLeft(&state);
 							break;
 						case 'H': // Home
-							linenoiseEditMoveHome(&l);
+							editMoveHome(&state);
 							break;
 						case 'F': // End
-							linenoiseEditMoveEnd(&l);
+							editMoveEnd(&state);
 							break;
 						}
 					}
@@ -444,278 +520,179 @@ private:
 				else if (seq[0] == 'O') {
 					switch (seq[1]) {
 					case 'H': // Home
-						linenoiseEditMoveHome(&l);
+						editMoveHome(&state);
 						break;
 					case 'F': // End
-						linenoiseEditMoveEnd(&l);
+						editMoveEnd(&state);
 						break;
 					}
 				}
 				break;
 			default:
-				if (linenoiseEditInsert(&l, c)) {
-					return -1;
+				if (editInsert(&state, ch)) {
+					return {};
 				}
 				break;
 			case CTRL_U: // Ctrl+u, delete the whole line.
-				buf[0] = '\0';
-				l.pos = l.len = 0;
-				refreshLine(&l);
+				state.buf.clear();
+				state.pos = 0;
+				refreshLine(&state);
 				break;
 			case CTRL_K: // Ctrl+k, delete from current to end of line.
-				buf[l.pos] = '\0';
-				l.len      = l.pos;
-				refreshLine(&l);
+				state.buf.erase(state.pos);
+				refreshLine(&state);
 				break;
 			case CTRL_A: // Ctrl+a, go to the start of the line
-				linenoiseEditMoveHome(&l);
+				editMoveHome(&state);
 				break;
 			case CTRL_E: // ctrl+e, go to the end of the line
-				linenoiseEditMoveEnd(&l);
+				editMoveEnd(&state);
 				break;
 			case CTRL_L: // ctrl+l, clear screen
 				clearScreen();
-				refreshLine(&l);
+				refreshLine(&state);
 				break;
 			case CTRL_W: // ctrl+w, delete previous word
-				linenoiseEditDeletePrevWord(&l);
+				editDeletePreviousWord(&state);
 				break;
 			}
 		}
-		return l.len;
+		return state.buf;
 	}
 
 	// Insert the character 'c' at cursor current position. On error writing to the terminal -1 is returned, otherwise 0.
-	int linenoiseEditInsert(State *l, char c) {
-		if (l->len < l->buflen) {
-			if (l->len == l->pos) {
-				l->buf[l->pos] = c;
-				l->pos++;
-				l->len++;
-				l->buf[l->len] = '\0';
-				if ((!multi_line_mode && prompt.size() + l->len < l->cols && !hints_handler_)) {
-					// Avoid a full update of the line in the trivial case.
-					const char d = (mask_mode) ? '*' : c;
-					if (write_char(d) == -1) {
-						return -1;
-					}
-				} else {
-					refreshLine(l);
+	int editInsert(State *state, char ch) {
+		if (state->buf.size() == state->pos) {
+			state->buf.insert(state->pos++, 1, ch);
+
+			if (prompt.size() + state->buf.size() < state->cols && !hints_handler_) {
+				// Avoid a full update of the line in the trivial case.
+				const char d = (mask_mode) ? '*' : ch;
+				if (write_char(d) == -1) {
+					return -1;
 				}
 			} else {
-				memmove(l->buf + l->pos + 1, l->buf + l->pos, l->len - l->pos);
-				l->buf[l->pos] = c;
-				l->len++;
-				l->pos++;
-				l->buf[l->len] = '\0';
-				refreshLine(l);
+				refreshLine(state);
 			}
+		} else {
+			state->buf.insert(state->pos++, 1, ch);
+			refreshLine(state);
 		}
 		return 0;
 	}
 
 	// Move cursor on the left.
-	void linenoiseEditMoveLeft(State *l) {
-		if (l->pos > 0) {
-			l->pos--;
-			refreshLine(l);
+	void editMoveLeft(State *state) {
+		if (state->pos > 0) {
+			state->pos--;
+			refreshLine(state);
 		}
 	}
 
 	// Move cursor on the right.
-	void linenoiseEditMoveRight(State *l) {
-		if (l->pos != l->len) {
-			l->pos++;
-			refreshLine(l);
+	void editMoveRight(State *state) {
+		if (state->pos != state->buf.size()) {
+			state->pos++;
+			refreshLine(state);
 		}
 	}
 
 	// Move cursor to the start of the line.
-	void linenoiseEditMoveHome(State *l) {
-		if (l->pos != 0) {
-			l->pos = 0;
-			refreshLine(l);
+	void editMoveHome(State *state) {
+		if (state->pos != 0) {
+			state->pos = 0;
+			refreshLine(state);
 		}
 	}
 
 	// Move cursor to the end of the line.
-	void linenoiseEditMoveEnd(State *l) {
-		if (l->pos != l->len) {
-			l->pos = l->len;
-			refreshLine(l);
+	void editMoveEnd(State *state) {
+		if (state->pos != state->buf.size()) {
+			state->pos = state->buf.size();
+			refreshLine(state);
 		}
 	}
 
 	// Substitute the currently edited line with the next or previous history entry as specified by 'dir'.
-	void linenoiseEditHistoryNext(State *l, Direction dir) {
+	void editHistoryNext(State *state, Direction dir) {
 
 		if (!history_.empty()) {
 			// Update the current history entry before to overwrite it with the next one.
-			history_[history_.size() - 1 - l->history_index] = l->buf;
+			history_[history_.size() - 1 - state->history_index] = state->buf;
 
 			switch (dir) {
 			case Direction::Prev:
-				++l->history_index;
-				if (l->history_index >= history_.size()) {
-					l->history_index = history_.size() - 1;
+				++state->history_index;
+				if (state->history_index >= history_.size()) {
+					state->history_index = history_.size() - 1;
 					return;
 				}
 				break;
 			case Direction::Next:
-				if (l->history_index == 0) {
+				if (state->history_index == 0) {
 					return;
 				}
-				--l->history_index;
+				--state->history_index;
 			}
 
 			// Show the new entry
-			strncpy(l->buf, history_[history_.size() - 1 - l->history_index].c_str(), l->buflen);
-			l->buf[l->buflen - 1] = '\0';
-			l->len = l->pos = strlen(l->buf);
-			refreshLine(l);
+			state->buf = history_[history_.size() - 1 - state->history_index];
+			state->pos = state->buf.size();
+			refreshLine(state);
 		}
 	}
 
 	// Delete the character at the right of the cursor without altering the cursor position.
 	// Basically this is what happens with the "Delete" keyboard key.
-	void linenoiseEditDelete(State *l) {
-		if (l->len > 0 && l->pos < l->len) {
-			memmove(l->buf + l->pos, l->buf + l->pos + 1, l->len - l->pos - 1);
-			l->len--;
-			l->buf[l->len] = '\0';
-			refreshLine(l);
+	void editDelete(State *state) {
+		if (!state->buf.empty() && state->pos < state->buf.size()) {
+			state->buf.erase(state->pos, 1);
+			refreshLine(state);
 		}
 	}
 
 	// Backspace implementation.
-	void linenoiseEditBackspace(State *l) {
-		if (l->pos > 0 && l->len > 0) {
-			memmove(l->buf + l->pos - 1, l->buf + l->pos, l->len - l->pos);
-			l->pos--;
-			l->len--;
-			l->buf[l->len] = '\0';
-			refreshLine(l);
+	void editBackspace(State *state) {
+		if (state->pos > 0 && !state->buf.empty()) {
+			state->buf.erase(--state->pos, 1);
+			refreshLine(state);
 		}
 	}
 
-	// Delete the previosu word, maintaining the cursor at the start of the current word.
-	void linenoiseEditDeletePrevWord(State *l) {
-		size_t old_pos = l->pos;
-		size_t diff;
+	// Delete the previous word, maintaining the cursor at the start of the current word.
+	void editDeletePreviousWord(State *state) {
+		const size_t old_pos = state->pos;
 
-		while (l->pos > 0 && l->buf[l->pos - 1] == ' ')
-			l->pos--;
+		while (state->pos > 0 && state->buf[state->pos - 1] == ' ')
+			state->pos--;
 
-		while (l->pos > 0 && l->buf[l->pos - 1] != ' ')
-			l->pos--;
+		while (state->pos > 0 && state->buf[state->pos - 1] != ' ')
+			state->pos--;
 
-		diff = old_pos - l->pos;
-		memmove(l->buf + l->pos, l->buf + old_pos, l->len - old_pos + 1);
-		l->len -= diff;
-		refreshLine(l);
+		const size_t diff = old_pos - state->pos;
+		state->buf.erase(state->pos, diff);
+		refreshLine(state);
 	}
 
-	// Calls the two low level functions refreshSingleLine() or refreshMultiLine() according to the selected mode.
-	void refreshLine(State *l) {
-		if (multi_line_mode)
-			refreshMultiLine(l);
-		else
-			refreshSingleLine(l);
-	}
-
-	// Multi line low level line refresh. Rewrite the currently edited line accordingly to the buffer content, cursor position, and number of columns of the terminal.
-	void refreshMultiLine(State *l) {
-		char seq[64];
-
-		int rows = (prompt.size() + l->len + l->cols - 1) / l->cols; // rows used by current buf.
-		int rpos = (prompt.size() + l->oldpos + l->cols) / l->cols;  // cursor relative row.
-
-		int rpos2; // rpos after refresh.
-		int old_rows = l->maxrows;
-		int j;
-		std::string ab;
-
-		// Update maxrows if needed.
-		if (rows > static_cast<int>(l->maxrows))
-			l->maxrows = rows;
-
-		// First step: clear all the lines used before. To do so start by going to the last row.
-		if (old_rows - rpos > 0) {
-			snprintf(seq, sizeof(seq), "\x1b[%dB", old_rows - rpos);
-			ab.append(seq);
-		}
-
-		// Now for every row clear it, go up.
-		for (j = 0; j < old_rows - 1; j++) {
-			snprintf(seq, sizeof(seq), "\r\x1b[0K\x1b[1A");
-			ab.append(seq);
-		}
-
-		// Clean the top line.
-		snprintf(seq, sizeof(seq), "\r\x1b[0K");
-		ab.append(seq);
-
-		// Write the prompt and the current buffer content
-		ab.append(prompt);
-		if (mask_mode) {
-			ab.append(l->len, '*');
-		} else {
-			ab.append(l->buf, l->len);
-		}
-
-		// Show hits if any.
-		refreshShowHints(ab, l, prompt.size());
-
-		// If we are at the very end of the screen with our prompt, we need to emit a newline and move the prompt to the first column.
-		if (l->pos && l->pos == l->len && (l->pos + prompt.size()) % l->cols == 0) {
-			ab.append("\n");
-			snprintf(seq, sizeof(seq), "\r");
-			ab.append(seq);
-			rows++;
-			if (rows > static_cast<int>(l->maxrows)) {
-				l->maxrows = rows;
-			}
-		}
-
-		// Move cursor to right position.
-		rpos2 = (prompt.size() + l->pos + l->cols) / l->cols; // current cursor relative row.
-
-		// Go up till we reach the expected positon.
-		if (rows - rpos2 > 0) {
-			snprintf(seq, sizeof(seq), "\x1b[%dA", rows - rpos2);
-			ab.append(seq);
-		}
-
-		// Set column.
-		const size_t col = (prompt.size() + l->pos) % l->cols;
-		if (col)
-			snprintf(seq, sizeof(seq), "\r\x1b[%dC", static_cast<int>(col));
-		else
-			snprintf(seq, sizeof(seq), "\r");
-		ab.append(seq);
-
-		l->oldpos = l->pos;
-
-		write_string(ab);
+	void refreshLine(State *state) {
+		refreshSingleLine(state);
 	}
 
 	// Single line low level line refresh. Rewrite the currently edited line accordingly to the buffer content, cursor position, and number of columns of the terminal.
-	void refreshSingleLine(State *l) {
+	void refreshSingleLine(State *state) {
 		char seq[64];
 		const size_t plen = prompt.size();
-		char *buf         = l->buf;
-		size_t len        = l->len;
-		size_t pos        = l->pos;
+		std::string_view buf_view(state->buf);
+		size_t pos = state->pos;
 		std::string ab;
 
-		while ((plen + pos) >= l->cols) {
-			buf++;
-			len--;
+		while (plen + pos >= state->cols) {
+			buf_view.remove_prefix(1);
 			pos--;
 		}
 
-		while (plen + len > l->cols) {
-			len--;
+		while (plen + buf_view.size() > state->cols) {
+			buf_view.remove_suffix(1);
 		}
 
 		// Cursor to left edge
@@ -725,12 +702,12 @@ private:
 		ab.append(prompt);
 
 		if (mask_mode) {
-			ab.append(len, '*');
+			ab.append(buf_view.size(), '*');
 		} else {
-			ab.append(buf, len);
+			ab.append(buf_view);
 		}
 		// Show hits if any.
-		refreshShowHints(ab, l, plen);
+		refreshShowHints(ab, state, plen);
 		// Erase to right
 		snprintf(seq, sizeof(seq), "\x1b[0K");
 		ab.append(seq);
@@ -741,25 +718,8 @@ private:
 		write_string(ab);
 	}
 
-	// Clear the screen. Used to handle ctrl+l
-	void clearScreen() {
-		write_string("\x1b[H\x1b[2J");
-	}
-
-	// Beep, used for completion when there is nothing to complete or when all the choices were already shown.
-	static void beep() {
-		fprintf(stderr, "\x7");
-		fflush(stderr);
-	}
-
-	void disableRawMode(int fd) {
-		// Don't even check the return value as it's too late.
-		if (raw_mode && tcsetattr(fd, TCSAFLUSH, &orig_termios_) != -1) {
-			raw_mode = false;
-		}
-	}
-
-	// Use the ESC [6n escape sequence to query the horizontal cursor position and return it. On error -1 is returned, on success the position of the cursor.
+	// Use the ESC [6n escape sequence to query the horizontal cursor position and return it.
+	// On error -1 is returned, on success the position of the cursor.
 	int getCursorPosition() {
 		char buf[32];
 		int cols;
@@ -823,24 +783,24 @@ private:
 		}
 	}
 
-	// This is an helper function for linenoiseEdit() and is called when the user types the <tab> key in order to complete the string currently in the input.
+	// This is an helper function for editLine() and is called when the user types the <tab> key in order to complete the string currently in the input.
 	// The state of the editing is encapsulated into the pointed State structure as described in the structure definition.
 	int completeLine(State *ls) {
 
-		char c = 0;
+		char ch = 0;
 
 		// get a list of commands
-		std::vector<std::string> lc;
-		lc.reserve(commands_.size());
+		std::vector<std::string> completions;
+		completions.reserve(commands_.size());
 		for (auto &&elem : commands_) {
 			const std::string &name = elem.first;
 
 			if (starts_with(name, ls->buf)) {
-				lc.push_back(name);
+				completions.push_back(name);
 			}
 		}
 
-		if (lc.empty()) {
+		if (completions.empty()) {
 			beep();
 		} else {
 			bool stop = false;
@@ -848,44 +808,41 @@ private:
 
 			while (!stop) {
 				// Show completion or original buffer
-				if (i < lc.size()) {
+				if (i < completions.size()) {
 					State saved = *ls;
 
-					ls->len = ls->pos = lc[i].size();
-
-					strncpy(ls->buf, lc[i].c_str(), ls->buflen);
-					ls->buf[ls->buflen - 1] = '\0';
+					ls->pos = completions[i].size();
+					ls->buf = completions[i];
 
 					refreshLine(ls);
-					ls->len = saved.len;
 					ls->pos = saved.pos;
 					ls->buf = saved.buf;
 				} else {
 					refreshLine(ls);
 				}
 
-				int nread = read(in_fd_, &c, 1);
+				int nread = read(in_fd_, &ch, 1);
 				if (nread <= 0) {
 					return -1;
 				}
 
-				switch (c) {
+				switch (ch) {
 				case TAB: // tab
-					i = (i + 1) % (lc.size() + 1);
-					if (i == lc.size())
+					i = (i + 1) % (completions.size() + 1);
+					if (i == completions.size())
 						beep();
 					break;
 				case ESC: // escape
 					// Re-show original buffer
-					if (i < lc.size())
+					if (i < completions.size())
 						refreshLine(ls);
 					stop = true;
 					break;
 				default:
 					// Update buffer and return
-					if (i < lc.size()) {
-						int nwritten = snprintf(ls->buf, ls->buflen, "%s", lc[i].c_str());
-						ls->len = ls->pos = nwritten;
+					if (i < completions.size()) {
+						ls->buf = completions[i];
+						ls->pos = ls->buf.size();
 					}
 					stop = true;
 					break;
@@ -893,7 +850,7 @@ private:
 			}
 		}
 
-		return c; // Return last read character
+		return ch; // Return last read character
 	}
 
 	bool addHistoryEntry(const std::string &line) {
@@ -908,13 +865,13 @@ private:
 	}
 
 	// Helper of refreshSingleLine() and refreshMultiLine() to show hints to the right of the prompt.
-	void refreshShowHints(std::string &ab, State *l, int plen) {
+	void refreshShowHints(std::string &ab, State *state, int plen) {
 
-		if (hints_handler_ && plen + l->len < l->cols) {
+		if (hints_handler_ && plen + state->buf.size() < state->cols) {
 			int color = -1;
 			bool bold = false;
 
-			if (std::optional<std::string> hint = hints_handler_(l->buf, &color, &bold)) {
+			if (std::optional<std::string> hint = hints_handler_(state->buf, &color, &bold)) {
 				if (bold && color == -1) {
 					color = 37;
 				}
@@ -934,12 +891,6 @@ private:
 		}
 	}
 
-public:
-	void registerCommand(const std::string &cmd, command_type handler) {
-		commands_.emplace(cmd, handler);
-	}
-
-private:
 	ssize_t write_string(std::string_view str) const {
 		return write(out_fd_, str.data(), str.size());
 	}
@@ -949,10 +900,9 @@ private:
 	}
 
 public:
-	std::string prompt   = "(Cmd) ";
-	bool mask_mode       = false; // Show "***" instead of input. For passwords.
-	bool raw_mode        = false; // For atexit() function to check if restore is needed
-	bool multi_line_mode = false; // Multi line mode. Default is single line.
+	std::string prompt = "(Cmd) ";
+	bool mask_mode     = false; // Show "***" instead of input. For passwords.
+	bool raw_mode      = false;
 
 private:
 	std::string identchars_ = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
@@ -967,6 +917,7 @@ private:
 	hints_type hints_handler_;
 	struct termios orig_termios_; // In order to restore at exit.
 	std::vector<std::string> history_;
+	std::optional<std::string> history_file_;
 };
 
 #endif
