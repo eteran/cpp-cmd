@@ -494,7 +494,8 @@ private:
 				editHistoryNext(&state, Direction::Next);
 				break;
 			case ESC: // escape sequence
-				// Read the next two bytes representing the escape sequence. Use two calls to handle slow terminals returning the two chars at different times.
+				// Read the next two bytes representing the escape sequence.
+				// Use two calls to handle slow terminals returning the two chars at different times.
 				if (read(in_fd_, seq, 1) == -1)
 					break;
 				if (read(in_fd_, seq + 1, 1) == -1)
@@ -517,8 +518,11 @@ private:
 							}
 							break;
 						case ';':
-							// Extended escape, read two additional bytes.
-							if (read(in_fd_, seq + 3, 2) == -1)
+							// Read the next two bytes representing the escape sequence.
+							// Use two calls to handle slow terminals returning the two chars at different times.
+							if (read(in_fd_, seq + 3, 1) == -1)
+								break;
+							if (read(in_fd_, seq + 4, 1) == -1)
 								break;
 
 							if (seq[3] == '5' && seq[4] == 'D') {
