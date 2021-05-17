@@ -59,7 +59,7 @@ private:
 	static constexpr int MaxLineLength = 4096;
 
 	using hints_type   = std::function<std::optional<Hint>(std::string_view)>;
-	using command_type = std::function<bool(Cmd *cmd, std::string_view)>;
+	using command_type = std::function<bool(Cmd *cmd, const std::vector<std::string> &)>;
 
 	// The State structure represents the state during line editing.
 	// We pass this state to functions implementing specific editing functionalities.
@@ -74,8 +74,7 @@ private:
 	};
 
 	struct ParseResult {
-		std::string cmd;
-		std::string args;
+		std::vector<std::string> argv;
 		std::string line;
 	};
 
@@ -166,6 +165,64 @@ private:
 		return strchr("[]!()=+-*/%&|^~<>\t\n\r ", ch) != nullptr;
 	}
 
+	static std::vector<std::string> parseCommand(std::string_view cmdline) {
+
+		std::vector<std::string> args;
+		std::string arg;
+
+		int bcount     = 0;
+		bool in_quotes = false;
+
+		auto ch = cmdline.begin();
+
+		while (ch != cmdline.end()) {
+			if (!in_quotes && isspace(*ch)) {
+
+				// Close the argument and copy it
+				args.push_back(arg);
+				arg.clear();
+
+				// skip the remaining spaces
+				do {
+					++ch;
+				} while (isspace(*ch));
+
+				// Start with a new argument
+				bcount = 0;
+			} else if(!in_quotes && *ch == '#') {
+				while (ch != cmdline.end()) {
+					++ch;
+				}
+			} else if (*ch == '\\') {
+				arg.push_back(*ch++);
+				++bcount;
+
+			} else if (*ch == '"') {
+				if ((bcount & 1) == 0) {
+					// Preceded by an even number of '\', this is half that number of '\', plus a quote which we erase.
+					arg.erase(arg.size() - (bcount / 2));
+					in_quotes = !in_quotes;
+				} else {
+					// Preceded by an odd number of '\', this is half that number of '\' followed by a '"'
+					arg.erase(arg.size() - (bcount / 2 + 1));
+					arg.push_back('"');
+				}
+
+				++ch;
+				bcount = 0;
+			} else {
+				arg.push_back(*ch++);
+				bcount = 0;
+			}
+		}
+
+		if (!arg.empty()) {
+			args.push_back(arg);
+		}
+
+		return args;
+	}
+
 	static ParseResult parseline(std::string line) {
 
 		trim(line);
@@ -174,15 +231,12 @@ private:
 			return {};
 		}
 
-		size_t i = 0;
-		while (i < line.size() && !isDelim(line[i])) {
-			++i;
+		auto argv = parseCommand(line);
+		if(argv.empty()) {
+			return {};
 		}
 
-		std::string cmd  = line.substr(0, i);
-		std::string args = line.substr(i);
-		trim(args);
-		return ParseResult{cmd, args, line};
+		return ParseResult{argv, line};
 	}
 
 public:
@@ -305,7 +359,7 @@ private:
 	}
 
 	bool oneCmd(const std::string &str) {
-		auto [cmd, arg, line] = parseline(str);
+		auto [argv, line] = parseline(str);
 
 		if (line.empty()) {
 			return false;
@@ -313,13 +367,18 @@ private:
 
 		addHistoryEntry(line);
 
-		auto it = commands_.find(cmd);
+		// seprate check becuase we want to allow comments in the history
+		if (argv.empty()) {
+			return false;
+		}
+
+		auto it = commands_.find(argv[0]);
 		if (it == commands_.end()) {
 			return defaultHandler(line);
 		}
 
 		auto func = it->second;
-		return func(this, arg);
+		return func(this, argv);
 	}
 
 	bool defaultHandler(std::string_view line) {
@@ -408,16 +467,13 @@ private:
 		}
 
 		while (true) {
-			char ch;
-			char seq[5];
 
-			int nread = read(in_fd_, &ch, 1);
-			if (nread <= 0) {
+			char ch;
+			if (read_char(&ch) <= 0) {
 				return state.buf;
 			}
 
-			// Only autocomplete when the callback is set. It returns < 0 when there was an error reading from fd.
-			// Otherwise it will return the character that should be handled next.
+			// Only autocomplete when the callback is set.
 			if (ch == complete_key_) {
 				int r = completeLine(&state);
 				// Return on errors
@@ -431,6 +487,7 @@ private:
 				ch = r;
 			}
 
+			char seq[5];
 			switch (ch) {
 			case LINE_FEED:
 			case ENTER: // enter
@@ -465,7 +522,7 @@ private:
 				editBackspace(&state);
 				break;
 			case CTRL_D: // ctrl-d, remove char at right of cursor, or if the line is empty, act as end-of-file.
-				if (state.buf.size() > 0) {
+				if (!state.buf.empty()) {
 					editDelete(&state);
 				} else {
 					history_.pop_back();
@@ -476,8 +533,9 @@ private:
 				if (state.pos > 0 && state.pos < state.buf.size()) {
 					std::swap(state.buf[state.pos], state.buf[state.pos - 1]);
 
-					if (state.pos != state.buf.size() - 1)
+					if (state.pos != state.buf.size() - 1) {
 						state.pos++;
+					}
 					refreshLine(&state);
 				}
 				break;
@@ -496,18 +554,22 @@ private:
 			case ESC: // escape sequence
 				// Read the next two bytes representing the escape sequence.
 				// Use two calls to handle slow terminals returning the two chars at different times.
-				if (read(in_fd_, seq, 1) == -1)
+				if (read_char(&seq[0]) == -1) {
 					break;
-				if (read(in_fd_, seq + 1, 1) == -1)
+				}
+
+				if (read_char(&seq[1]) == -1) {
 					break;
+				}
 
 				// ESC [ sequences.
 				if (seq[0] == '[') {
 					if (isdigit(seq[1])) {
 
 						// Extended escape, read additional byte.
-						if (read(in_fd_, seq + 2, 1) == -1)
+						if (read_char(&seq[2]) == -1) {
 							break;
+						}
 
 						switch (seq[2]) {
 						case '~':
@@ -520,10 +582,13 @@ private:
 						case ';':
 							// Read the next two bytes representing the escape sequence.
 							// Use two calls to handle slow terminals returning the two chars at different times.
-							if (read(in_fd_, seq + 3, 1) == -1)
+							if (read_char(&seq[3]) == -1) {
 								break;
-							if (read(in_fd_, seq + 4, 1) == -1)
+							}
+
+							if (read_char(&seq[4]) == -1) {
 								break;
+							}
 
 							if (seq[3] == '5' && seq[4] == 'D') {
 								editMovePrevWord(&state);
@@ -872,19 +937,27 @@ private:
 
 		// Read the response: ESC [ rows ; cols R
 		while (i < sizeof(buf) - 1) {
-			if (read(in_fd_, buf + i, 1) != 1)
+			if (read_char(&buf[i]) != 1) {
 				break;
-			if (buf[i] == 'R')
+			}
+
+			if (buf[i] == 'R') {
 				break;
+			}
+
 			i++;
 		}
 		buf[i] = '\0';
 
 		// Parse it.
-		if (buf[0] != ESC || buf[1] != '[')
+		if (buf[0] != ESC || buf[1] != '[') {
 			return -1;
-		if (sscanf(buf + 2, "%d;%d", &rows, &cols) != 2)
+		}
+
+		if (sscanf(buf + 2, "%d;%d", &rows, &cols) != 2) {
 			return -1;
+		}
+
 		return cols;
 	}
 
@@ -960,8 +1033,7 @@ private:
 					refreshLine(state);
 				}
 
-				int nread = read(in_fd_, &ch, 1);
-				if (nread <= 0) {
+				if (read_char(&ch) <= 0) {
 					return -1;
 				}
 
@@ -1023,6 +1095,10 @@ private:
 
 	ssize_t write_char(char ch) const {
 		return write(out_fd_, &ch, 1);
+	}
+
+	ssize_t read_char(char *ch) const {
+		return read(in_fd_, ch, 1);
 	}
 
 public:

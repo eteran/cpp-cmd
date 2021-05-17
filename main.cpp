@@ -21,22 +21,24 @@ int main(int argc, char *argv[]) {
 		return {};
 	});
 
-	cmd.registerCommand("test", [](Cmd *cmd, std::string_view args) {
+	cmd.registerCommand("test", [](Cmd *cmd, const std::vector<std::string> &argv) {
 		(void)cmd;
-		(void)args;
 		printf("Hello World!\n");
+		for(size_t i = 1; i < argv.size(); ++i) {
+			printf("\t%s\n", argv[i].c_str());
+		}
 		return false;
 	});
 
-	cmd.registerCommand("clear", [](Cmd *cmd, std::string_view args) {
-		(void)args;
+	cmd.registerCommand("clear", [](Cmd *cmd, const std::vector<std::string> &argv) {
+		(void)argv;
 		cmd->clearScreen();
 		return false;
 	});
 
-	cmd.registerCommand("exit", [](Cmd *cmd, std::string_view args) {
+	cmd.registerCommand("exit", [](Cmd *cmd, const std::vector<std::string> &argv) {
 		(void)cmd;
-		(void)args;
+		(void)argv;
 		return true;
 	});
 
